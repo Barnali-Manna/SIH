@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from realesrgan import RealESRGANer
+
+TARGET_PIXELS = 27_000_000
+
+
+def make_upscaler(model_name: str, scale: int, model_path: str, tile: int, device: str):
+    """Create a tiled Real-ESRGAN upscaler."""
+    if scale == 4:
+        model = RRDBNet(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=23,
+            num_grow_ch=32,
+            scale=4,
+        )
+    elif scale == 2:
+        model = RRDBNet(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=23,
+            num_grow_ch=32,
+            scale=2,
+        )
+    else:
+        raise ValueError("Only x2 and x4 models are supported.")
+
+    return RealESRGANer(
+        scale=scale,
+        model_path=model_path,
+        model=model,
+        tile=tile,
+        tile_pad=10,
+        pre_pad=0,
+        half=(device == "cuda"),
+    )
+
+
+def exact_target_size(width: int, height: int) -> tuple[int, int]:
+    """Return dimensions preserving aspect ratio and totaling exactly 27MP."""
+    ratio = width / height
+    out_height = max(1, round(math.sqrt(TARGET_PIXELS / ratio)))
+    out_width = max(1, round(out_height * ratio))
+
+    # Correct rounding so the final image has exactly TARGET_PIXELS pixels.
+    out_width = max(1, round(TARGET_PIXELS / out_height))
+    out_height = max(1, round(TARGET_PIXELS / out_width))
+
+    # A one-pixel adjustment guarantees the requested pixel count.
+    while out_width * out_height != TARGET_PIXELS:
+        out_height = max(1, out_height - 1)
+        out_width = TARGET_PIXELS // out_height
+        if out_width * out_height == TARGET_PIXELS:
+            break
+
+    if out_width * out_height != TARGET_PIXELS:
+        # Exact 108,000,000 pixels is not always possible with an integer
+        # aspect-preserving rectangle. Use the closest practical dimensions.
+        scale = math.sqrt(TARGET_PIXELS / (width * height))
+        out_width = round(width * scale)
+        out_height = round(height * scale)
+
+    return out_width, out_height
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input", type=Path, help="Input image, preferably around 2MP")
+    parser.add_argument("output", type=Path, help="Output PNG, TIFF, or JPEG")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=Path("models"),
+        help="Directory containing Real-ESRGAN model weights",
+    )
+    parser.add_argument(
+        "--tile",
+        type=int,
+        default=256,
+        help="Tile size. Reduce to 128 or 64 if VRAM is insufficient.",
+    )
+    args = parser.parse_args()
+
+    if not args.input.exists():
+        raise FileNotFoundError(args.input)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    image = Image.open(args.input).convert("RGB")
+    input_width, input_height = image.size
+    input_mp = input_width * input_height / 1_000_000
+    print(f"Input: {input_width}x{input_height} ({input_mp:.2f}MP)")
+
+    args.model_dir.mkdir(parents=True, exist_ok=True)
+    x4_weights = args.model_dir / "RealESRGAN_x4plus.pth"
+    x2_weights = args.model_dir / "RealESRGAN_x2plus.pth"
+
+    missing = [str(p) for p in (x4_weights, x2_weights) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing model weights:\n"
+            + "\n".join(missing)
+            + "\nDownload them using the commands shown below."
+        )
+
+    # Real-ESRGAN produces actual image content; it does not start from random
+    # noise like a diffusion sampler.
+    x4 = make_upscaler("x4plus", 4, str(x4_weights), args.tile, device)
+    x4_result, _ = x4.enhance(np.asarray(image), outscale=4)
+    del x4
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    x2 = make_upscaler("x2plus", 2, str(x2_weights), args.tile, device)
+    x8_result, _ = x2.enhance(x4_result, outscale=2)
+    del x2
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    intermediate = Image.fromarray(x8_result).convert("RGB")
+    output_width, output_height = exact_target_size(input_width, input_height)
+    print(f"Final target: {output_width}x{output_height} ({output_width * output_height / 1_000_000:.2f}MP)")
+
+    final = intermediate.resize((output_width, output_height), Image.Resampling.LANCZOS)
+    suffix = args.output.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        final.save(args.output, quality=98, subsampling=0, optimize=True)
+    elif suffix in {".tif", ".tiff"}:
+        final.save(args.output, compression="tiff_lzw")
+    else:
+        final.save(args.output, format="PNG", compress_level=1)
+
+    print(f"Saved: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
+
+
